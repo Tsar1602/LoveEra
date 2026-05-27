@@ -1,7 +1,8 @@
 import os
 import random
 import time
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template
 from pywarera import wareraapi
@@ -9,7 +10,9 @@ from pywarera.wareraapi import WarEraServiceUnavailable
 
 app = Flask(__name__)
 
-DB_PATH    = 'loveera.db'
+# Mengambil URL Database Supabase dari Vercel Environment Variables
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
 TIER_RANK  = {'platinum': 4, 'gold': 3, 'silver': 2, 'bronze': 1, 'unknown': 0}
 WAR_SKILLS = ['attack', 'criticalChance', 'criticalDamages', 'armor', 'precision', 'dodge', 'lootChance']
 ECO_SKILLS = ['companies', 'entrepreneurship', 'production', 'management']
@@ -19,42 +22,61 @@ RANDOM_SEEDS = [
     'ro','ru','lu','mo','mu','ni','pa','pe','su','ta','vi','zo',
 ]
 
-# ── Database ─────────────────────────────────────────────
+# ── Database PostgreSQL ─────────────────────────────────────────────
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is missing!")
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute('''CREATE TABLE IF NOT EXISTS player_searches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
-        searched_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS matches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player1 TEXT NOT NULL,
-        player2 TEXT NOT NULL,
-        score INTEGER NOT NULL,
-        matched_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    con.commit()
-    con.close()
+    if not DATABASE_URL:
+        return
+    try:
+        con = get_db_connection()
+        cur = con.cursor()
+        # PostgreSQL menggunakan SERIAL, bukan AUTOINCREMENT
+        cur.execute('''CREATE TABLE IF NOT EXISTS player_searches (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(255) NOT NULL,
+            searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS matches (
+            id SERIAL PRIMARY KEY,
+            player1 VARCHAR(255) NOT NULL,
+            player2 VARCHAR(255) NOT NULL,
+            score INTEGER NOT NULL,
+            matched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        con.commit()
+        cur.close()
+        con.close()
+    except Exception as e:
+        print(f"Init DB Error: {e}")
 
 init_db()
 
 def record_searches(*usernames):
+    if not DATABASE_URL: return
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.executemany('INSERT INTO player_searches (username) VALUES (?)', [(u,) for u in usernames])
+        con = get_db_connection()
+        cur = con.cursor()
+        # PostgreSQL menggunakan %s, bukan ?
+        cur.executemany('INSERT INTO player_searches (username) VALUES (%s)', [(u,) for u in usernames])
         con.commit()
+        cur.close()
         con.close()
     except Exception:
         pass
 
 def record_match(p1, p2, score):
+    if not DATABASE_URL: return
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute('INSERT INTO matches (player1, player2, score) VALUES (?, ?, ?)', (p1, p2, score))
+        con = get_db_connection()
+        cur = con.cursor()
+        cur.execute('INSERT INTO matches (player1, player2, score) VALUES (%s, %s, %s)', (p1, p2, score))
         con.commit()
+        cur.close()
         con.close()
     except Exception:
         pass
@@ -397,28 +419,32 @@ def random_match():
 
 @app.route('/stats')
 def stats():
+    if not DATABASE_URL:
+        return jsonify({'leaderboard': {'today': [], 'weekly': [], 'alltime': []}, 'recent_matches': []})
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.row_factory = sqlite3.Row
+        con = get_db_connection()
+        # Menggunakan psycopg2.extras.RealDictCursor agar outputnya seperti dictionary
+        cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         now         = datetime.utcnow()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         week_start  = (now - timedelta(days=7)).isoformat()
 
         def top_searched(where_clause='', params=()):
-            return [dict(r) for r in con.execute(
-                f'SELECT username, COUNT(*) as cnt FROM player_searches '
+            cur.execute(
+                f'SELECT MAX(username) as username, COUNT(*) as cnt FROM player_searches '
                 f'{where_clause} GROUP BY LOWER(username) ORDER BY cnt DESC LIMIT 5',
                 params
-            ).fetchall()]
+            )
+            return [dict(r) for r in cur.fetchall()]
 
         leaderboard = {
-            'today':   top_searched('WHERE searched_at >= ?', (today_start,)),
-            'weekly':  top_searched('WHERE searched_at >= ?', (week_start,)),
+            'today':   top_searched('WHERE searched_at >= %s', (today_start,)),
+            'weekly':  top_searched('WHERE searched_at >= %s', (week_start,)),
             'alltime': top_searched(),
         }
-        recent = [dict(r) for r in con.execute(
-            'SELECT player1, player2, score, matched_at FROM matches ORDER BY matched_at DESC LIMIT 10'
-        ).fetchall()]
+        cur.execute('SELECT player1, player2, score, matched_at FROM matches ORDER BY matched_at DESC LIMIT 10')
+        recent = [dict(r) for r in cur.fetchall()]
+        cur.close()
         con.close()
         return jsonify({'leaderboard': leaderboard, 'recent_matches': recent})
     except Exception as e:
