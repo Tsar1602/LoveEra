@@ -1,3 +1,4 @@
 Flask
 requests
 pywarera
+psycopg2-binary
